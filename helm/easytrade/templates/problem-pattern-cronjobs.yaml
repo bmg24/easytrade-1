@@ -1,0 +1,80 @@
+{{- /*
+Problem-pattern scheduler.
+
+easyTrade problem-pattern feature flags are *sticky*: once a flag is set to
+`enabled: true` it stays on until something sets it back to `false`. The app
+code (and the problem-operator) react continuously to the flag state — there is
+no built-in timer or auto-disable. The original upstream repo shipped paired
+enable/disable CronJobs under kubernetes-manifests/problem-patterns/ to drive
+the patterns on a daily schedule; those were dropped when easyTrade moved to a
+Helm chart. This template restores that behaviour as a configurable part of the
+chart so ArgoCD keeps it in sync.
+
+For each pattern we render two CronJobs (enable + disable) that PUT to the
+feature-flag-service. Disabled by default — opt in via values.
+*/ -}}
+{{- if .Values.problemPatterns.cronjobs.enabled }}
+{{- $root := . }}
+{{- $cfg := .Values.problemPatterns.cronjobs }}
+{{- $ffsHost := tpl ($cfg.featureFlagServiceHost | default "{{ .Release.Name }}-feature-flag-service") $root }}
+{{- $port := $cfg.featureFlagServicePort | default 8080 }}
+{{- $image := $cfg.image | default "curlimages/curl:8.7.1" }}
+{{- range $cfg.patterns }}
+{{- $flag := .id }}
+{{- $slug := $flag | replace "_" "-" }}
+{{- $actions := list (dict "verb" "enable" "value" "true" "schedule" .enableSchedule) (dict "verb" "disable" "value" "false" "schedule" .disableSchedule) }}
+{{- range $actions }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $root.Release.Name }}-{{ .verb }}-{{ $slug }}
+  labels:
+    {{- include "easytrade.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: problem-pattern-scheduler
+    easytrade.problem-pattern/flag: {{ $flag }}
+    easytrade.problem-pattern/action: {{ .verb }}
+spec:
+  schedule: {{ .schedule | quote }}
+  {{- with $cfg.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 120
+      backoffLimit: 3
+      template:
+        metadata:
+          # Throwaway curl job — keep OneAgent out of it so it doesn't pollute
+          # process/PGI data in the tenant.
+          annotations:
+            oneagent.dynatrace.com/inject: "false"
+          labels:
+            app.kubernetes.io/component: problem-pattern-scheduler
+            easytrade.problem-pattern/flag: {{ $flag }}
+            easytrade.problem-pattern/action: {{ .verb }}
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: {{ .verb }}-{{ $slug }}
+              image: {{ $image | quote }}
+              imagePullPolicy: IfNotPresent
+              command: ["curl"]
+              args:
+                - "-sS"
+                - "--fail"
+                - "--retry"
+                - "3"
+                - "-X"
+                - "PUT"
+                - "-H"
+                - "Content-Type: application/json"
+                - "-d"
+                - '{"enabled": {{ .value }}}'
+                - "http://{{ $ffsHost }}:{{ $port }}/v1/flags/{{ $flag }}"
+{{- end }}
+{{- end }}
+{{- end }}

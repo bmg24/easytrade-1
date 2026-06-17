@@ -10,6 +10,40 @@ global:
   # Environment variables to be added to all pods
   env: {}
 
+# Problem-pattern scheduler (see templates/problem-pattern-cronjobs.yaml).
+# easyTrade problem-pattern flags are sticky — they stay on until toggled off.
+# These CronJobs drive the 4 documented patterns on a rotating schedule so the
+# tenant continuously shows fresh Dynatrace problems.
+#
+# Cadence (UTC): one pattern fires each hour on the hour, cycling through all
+# four every 4h (6 windows/pattern/day), ~25-30 min each — so at most one
+# problem is active at a time. Times are cluster time (UTC on GKE) unless
+# `timeZone` is set.
+problemPatterns:
+  cronjobs:
+    enabled: true
+    image: curlimages/curl:8.7.1
+    # Defaults to "<release>-feature-flag-service"; rendered with tpl.
+    featureFlagServiceHost: ""
+    featureFlagServicePort: 8080
+    # IANA tz for the schedules below; empty = cluster time (UTC on GKE).
+    timeZone: ""
+    patterns:
+      - id: db_not_responding          # new trades fail; ~20 min -> DT problem
+        enableSchedule:  "0 0,4,8,12,16,20 * * *"
+        disableSchedule: "25 0,4,8,12,16,20 * * *"
+      - id: high_cpu_usage             # broker-service slowdown + CPU limit (operator) -> throttling
+        enableSchedule:  "0 1,5,9,13,17,21 * * *"
+        disableSchedule: "25 1,5,9,13,17,21 * * *"
+      - id: ergo_aggregator_slowdown   # OfferService delays 2/5 aggregators -> traffic drop
+        enableSchedule:  "0 2,6,10,14,18,22 * * *"
+        disableSchedule: "25 2,6,10,14,18,22 * * *"
+      - id: factory_crisis             # card factory stops -> credit-card orders blocked
+        enableSchedule:  "0 3,7,11,15,19,23 * * *"
+        disableSchedule: "30 3,7,11,15,19,23 * * *"
+      # credit_card_validation: omitted — needs MAINFRAME_SERVICE_URL (no mainframe in this tenant).
+      # credit_card_meltdown:   omitted — frontend-only error page, not in the documented set.
+
 accountservice:
   enabled: true
   # Example of overriding the image repository for a specific service
