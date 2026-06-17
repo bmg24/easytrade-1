@@ -1,0 +1,238 @@
+name: SDLC pipeline (easytrade)
+
+# Emits normalized Dynatrace SDLC_EVENTs across the full delivery lifecycle so the
+# tenant gets pipeline-observability data:
+#   - merge to main  -> pipeline run started -> build -> deployment -> pipeline run finished
+#   - pull requests   -> change started / change finished
+#
+# This lives in the FORK (bmg24/easytrade-1). The app is deployed to GKE by ArgoCD
+# (Helm chart at helm/easytrade); the "deployment" events here represent that rollout,
+# keyed to the merged commit. (For an event sourced by the deployer itself, add
+# ArgoCD notifications later.)
+#
+# Required repo (or org) secrets on THIS repo:
+#   DT_URL        e.g. https://anr47691.sprint.dynatracelabs.com   (no /api, no trailing slash)
+#   DT_SDLC_TOKEN access token with scope: openpipeline.events_sdlc
+#
+# The reusable sender lives in the gitops repo:
+#   bmg24/gitops/.github/actions/dt-sdlc-event@main
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, reopened, closed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DT_URL: ${{ secrets.DT_URL }}
+  DT_TOKEN: ${{ secrets.DT_SDLC_TOKEN }}
+  ARTIFACT_ID: easytrade
+  ARTIFACT_NAME: EasyTrade
+  DEPLOY_NS: easytrade
+  RELEASE_STAGE: production
+  K8S_SERVER: https://kubernetes.default.svc
+  CHART_PATH: helm/easytrade
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Full delivery lifecycle on merge to main (or manual run).
+  # ---------------------------------------------------------------------------
+  delivery:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the static SDLC property blobs once and expose as outputs.
+      - name: Build SDLC context
+        id: ctx
+        run: |
+          set -euo pipefail
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          WF_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/workflows/sdlc.yml"
+          REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          SHORT_SHA="${GITHUB_SHA:0:8}"
+
+          pipeline="$(jq -nc \
+            --arg provider "github.com" \
+            --arg pid "$GITHUB_WORKFLOW" \
+            --arg pname "easytrade delivery" \
+            --arg rid "$GITHUB_RUN_ID" \
+            --arg rurl "$RUN_URL" \
+            --arg purl "$WF_URL" \
+            --arg rname "$GITHUB_REF_NAME" \
+            --arg rev "$GITHUB_SHA" \
+            --arg repo "$REPO_NAME" \
+            --arg repourl "$REPO_URL" \
+            '{ "event.provider":$provider, "cicd.pipeline.id":$pid, "cicd.pipeline.name":$pname,
+               "cicd.pipeline.run.id":$rid, "cicd.pipeline.run.url.full":$rurl, "cicd.pipeline.url.full":$purl,
+               "vcs.ref.head.name":$rname, "vcs.ref.head.revision":$rev,
+               "vcs.repository.name":$repo, "vcs.repository.url.full":$repourl }')
+
+          build="$(jq -nc \
+            --arg provider "github.com" \
+            --arg pid "$GITHUB_WORKFLOW" \
+            --arg rid "$GITHUB_RUN_ID" \
+            --arg aid "$ARTIFACT_ID" \
+            --arg aname "$ARTIFACT_NAME" \
+            --arg aver "$SHORT_SHA" \
+            --arg tid "$GITHUB_RUN_NUMBER" \
+            --arg tname "helm template easytrade" \
+            '{ "event.provider":$provider, "cicd.pipeline.id":$pid, "cicd.pipeline.run.id":$rid,
+               "artifact.id":$aid, "artifact.name":$aname, "artifact.version":$aver,
+               "task.id":$tid, "task.name":$tname }')
+
+          deploy="$(jq -nc \
+            --arg provider "github.com" \
+            --arg dname "deploy easytrade" \
+            --arg ns "$DEPLOY_NS" \
+            --arg stage "$RELEASE_STAGE" \
+            --arg srv "$K8S_SERVER" \
+            --arg aid "$ARTIFACT_ID" \
+            --arg aver "$SHORT_SHA" \
+            --arg rev "$GITHUB_SHA" \
+            --arg repourl "$REPO_URL" \
+            '{ "event.provider":$provider, "cicd.deployment.name":$dname, "cicd.deployment.namespace":$ns,
+               "cicd.deployment.release_stage":$stage, "cicd.deployment.server.url.full":$srv,
+               "artifact.id":$aid, "artifact.version":$aver,
+               "vcs.ref.base.revision":$rev, "vcs.repository.url.full":$repourl }')
+
+          { echo "pipeline=$pipeline"; echo "build=$build"; echo "deploy=$deploy"; } >> "$GITHUB_OUTPUT"
+
+      - name: SDLC - pipeline run started
+        uses: bmg24/gitops/.github/actions/dt-sdlc-event@main
+        with:
+          dt-url: ${{ env.DT_URL }}
+          dt-token: ${{ env.DT_TOKEN }}
+          event-type: run
+          event-status: started
+          properties: ${{ steps.ctx.outputs.pipeline }}
+
+      - name: SDLC - build started
+        uses: bmg24/gitops/.github/actions/dt-sdlc-event@main
+        with:
+          dt-url: ${{ env.DT_URL }}
+          dt-token: ${{ env.DT_TOKEN }}
+          event-type: build
+          event-status: started
+          properties: ${{ steps.ctx.outputs.build }}
+
+      # Real "build": render the Helm chart. Tolerant so it never blocks the demo —
+      # the true outcome is reported in the events.
+      - name: Helm render
+        id: build
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm dependency build "${CHART_PATH}" || true
+          helm template easytrade "${CHART_PATH}" > /tmp/rendered.yaml
+          echo "Rendered $(grep -c '^kind:' /tmp/rendered.yaml || echo 0) resources."
+
+      - name: Resolve outcomes
+        id: res
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.build.outcome }}" == "success" ]]; then
+            TASK_OUTCOME="Success"; DEPLOY_STATUS="succeeded"; PIPE_OUTCOME="success"
+          else
+            TASK_OUTCOME="Failure"; DEPLOY_STATUS="failed";    PIPE_OUTCOME="failure"
+          fi
+          build_fin="$(jq -nc --argjson b '${{ steps.ctx.outputs.build }}' --arg o "$TASK_OUTCOME" '$b + {"task.outcome":$o}')"
+          deploy_fin="$(jq -nc --argjson d '${{ steps.ctx.outputs.deploy }}' --arg s "$DEPLOY_STATUS" --arg o "$TASK_OUTCOME" '$d + {"cicd.deployment.status":$s, "task.outcome":$o}')"
+          pipe_fin="$(jq -nc --argjson p '${{ steps.ctx.outputs.pipeline }}' --arg o "$PIPE_OUTCOME" '$p + {"cicd.pipeline.run.outcome":$o}')"
+          { echo "build_fin=$build_fin"; echo "deploy_fin=$deploy_fin"; echo "pipe_fin=$pipe_fin"; } >> "$GITHUB_OUTPUT"
+
+      - name: SDLC - build finished
+        uses: bmg24/gitops/.github/actions/dt-sdlc-event@main
+        with:
+          dt-url: ${{ env.DT_URL }}
+          dt-token: ${{ env.DT_TOKEN }}
+          event-type: build
+          event-status: finished
+          properties: ${{ steps.res.outputs.build_fin }}
+
+      - name: SDLC - deployment started
+        uses: bmg24/gitops/.github/actions/dt-sdlc-event@main
+        with:
+          dt-url: ${{ env.DT_URL }}
+          dt-token: ${{ env.DT_TOKEN }}
+          event-type: deployment
+          event-status: started
+          properties: ${{ steps.ctx.outputs.deploy }}
+
+      - name: SDLC - deployment finished
+        uses: bmg24/gitops/.github/actions/dt-sdlc-event@main
+        with:
+          dt-url: ${{ env.DT_URL }}
+          dt-token: ${{ env.DT_TOKEN }}
+          event-type: deployment
+          event-status: finished
+          properties: ${{ steps.res.outputs.deploy_fin }}
+
+      - name: SDLC - pipeline run finished
+        uses: bmg24/gitops/.github/actions/dt-sdlc-event@main
+        with:
+          dt-url: ${{ env.DT_URL }}
+          dt-token: ${{ env.DT_TOKEN }}
+          event-type: run
+          event-status: finished
+          properties: ${{ steps.res.outputs.pipe_fin }}
+
+  # ---------------------------------------------------------------------------
+  # Change (pull request) events.
+  # ---------------------------------------------------------------------------
+  change:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build change context
+        id: ctx
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          if [[ "${{ github.event.action }}" == "closed" ]]; then
+            STATUS="finished"
+            if [[ "$PR_MERGED" == "true" ]]; then STATE="merged"; else STATE="closed"; fi
+          else
+            STATUS="started"; STATE="open"
+          fi
+          props="$(jq -nc \
+            --arg provider "github.com" \
+            --arg cid "$PR_NUMBER" \
+            --arg title "$PR_TITLE" \
+            --arg url "$PR_URL" \
+            --arg state "$STATE" \
+            --arg head "$HEAD_REF" \
+            --arg base "$BASE_REF" \
+            --arg repo "$REPO_NAME" \
+            --arg repourl "$REPO_URL" \
+            --arg tname "[Pull Request] $PR_TITLE" \
+            '{ "event.provider":$provider, "vcs.change.id":$cid, "vcs.change.title":$title,
+               "vcs.change.url.full":$url, "vcs.change.state":$state,
+               "vcs.ref.head.name":$head, "vcs.ref.base.name":$base,
+               "vcs.repository.name":$repo, "vcs.repository.url.full":$repourl,
+               "task.id":$cid, "task.name":$tname }')
+          { echo "status=$STATUS"; echo "props=$props"; } >> "$GITHUB_OUTPUT"
+
+      - name: SDLC - change event
+        uses: bmg24/gitops/.github/actions/dt-sdlc-event@main
+        with:
+          dt-url: ${{ env.DT_URL }}
+          dt-token: ${{ env.DT_TOKEN }}
+          event-type: change
+          event-status: ${{ steps.ctx.outputs.status }}
+          properties: ${{ steps.ctx.outputs.props }}
