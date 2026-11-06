@@ -4,7 +4,9 @@ global:
   image:
     # Base repository for all images. Individual services can override the repository if needed.
     baseRepository: "europe-docker.pkg.dev/dynatrace-demoability/docker/easytrade"
-    tag: latest
+    # Pinned to the last v1.x release. :latest moved to easytrade v2.0.x (2026-11-02), which adds
+    # db-adapter and needs DB_ADAPTER_ADDRESS; this chart is still the v1 architecture.
+    tag: 1.5.11
   # Global labels to be added to all resources
   labels: {}
   # Environment variables to be added to all pods
